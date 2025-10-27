@@ -637,20 +637,22 @@ def sequencer_update():
     if not is_playing:
         return
     now = pygame.time.get_ticks()
-    all_finished = True
+    any_active = False
 
     for label, seq in SEQUENCE.items():
         st = track_state.get(label)
         if not st or st['finished']:
             continue
 
-        # Turn off if time passed
-        if st['current'] not in (None, 'rest') and now >= st['off_ms']:
-            _stop_current_for_track(st)
+        # Turn off if time passed (including rests)
+        if st['current'] is not None and now >= st['off_ms']:
+            if st['current'] != 'rest':
+                _stop_current_for_track(st)
+            else:
+                st['current'] = None  # Clear rest so next event can start
 
         # Start next if ready
         if st['current'] is None and now >= st['next_on_ms']:
-            # Consume any control tokens (e.g., Triolé) before starting a sounding event
             while True:
                 st['idx'] += 1
                 if st['idx'] >= st['len']:
@@ -662,14 +664,13 @@ def sequencer_update():
                     scale, count = _compute_triole_scale(seq, st['idx'], base_unit)
                     st['trip_scale'] = scale
                     st['trip_remaining'] = count
-                    # Continue to next token
                     continue
-                # Non-control event reached; schedule it
+
                 note, beats = ev
 
-                # Effective duration with Triolé if active
+                # Handle variable-duration chords (beats is None, note is [(note, dur), ...])
                 if beats is None and isinstance(note, list) and note and isinstance(note[0], tuple):
-                    # variable-duration chord: scale each note's duration
+                    # Variable-duration chord: scale each note's duration if triplet active
                     eff_notes = []
                     for n, d in note:
                         d_eff = d * st['trip_scale'] if st['trip_remaining'] > 0 else d
@@ -683,25 +684,40 @@ def sequencer_update():
                     dur_ms = beats_to_ms(max_dur, BPM)
                     st['off_ms'] = now + dur_ms
                     st['next_on_ms'] = now + dur_ms
-                else:
-                    # Normal note/chord/rest
-                    eff_beats = beats
-                    if isinstance(eff_beats, (int, float)) and st['trip_remaining'] > 0:
-                        eff_beats = eff_beats * st['trip_scale']
-                    dur_ms = beats_to_ms(eff_beats, BPM)
-                    if note != 'rest':
-                        if isinstance(note, list):
-                            for n in note:
-                                PLAYING_SEQ_NOTES.add(n)
-                                play_note(n)
-                        else:
-                            PLAYING_SEQ_NOTES.add(note)
-                            play_note(note)
-                        st['current'] = note
-                    else:
-                        st['current'] = 'rest'
-                    st['off_ms'] = now + dur_ms
+                    # Consume triplet slot if active
+                    if st['trip_remaining'] > 0:
+                        st['trip_remaining'] -= 1
+                        if st['trip_remaining'] == 0:
+                            st['trip_scale'] = 1.0
+                    break
+                
+                # Handle rests correctly
+                if note == 'rest':
+                    # Schedule the next note after the rest duration
+                    dur_ms = beats_to_ms(beats, BPM)
+                    st['current'] = 'rest'
                     st['next_on_ms'] = now + dur_ms
+                    st['off_ms'] = now + dur_ms
+                    break  # Skip to the next iteration to check if we can play the next note
+
+                # Normal note/chord
+                eff_beats = beats if beats is not None else 0  # Ensure eff_beats is not None
+                if isinstance(eff_beats, (int, float)) and st['trip_remaining'] > 0:
+                    eff_beats = eff_beats * st['trip_scale']
+                dur_ms = beats_to_ms(eff_beats, BPM)
+                if note != 'rest':
+                    if isinstance(note, list):
+                        for n in note:
+                            PLAYING_SEQ_NOTES.add(n)
+                            play_note(n)
+                    else:
+                        PLAYING_SEQ_NOTES.add(note)
+                        play_note(note)
+                    st['current'] = note
+                else:
+                    st['current'] = 'rest'
+                st['off_ms'] = now + dur_ms
+                st['next_on_ms'] = now + dur_ms
 
                 # Consume one of the triolé slots if active
                 if st['trip_remaining'] > 0:
@@ -711,9 +727,10 @@ def sequencer_update():
                 break  # scheduled one event this tick
 
         if not st['finished']:
-            all_finished = False
+            any_active = True
 
-    if all_finished:
+    # Stop only when ALL tracks are finished
+    if not any_active:
         sequencer_stop()
 
 # --- Events / Main loop ---
